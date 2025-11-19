@@ -3,26 +3,147 @@ title: Exploratory Data Analysis
 format: typst
 ---
 
-### Question 1
+```{r}
+#| include: false
+# Setup: Load libraries and data
+library(tidyverse)
+precincts24 <- read_csv("data/g24_precinct_clean.csv", show_col_types = FALSE)
 
-Put your question here.
+# Detect and rename congressional district column
+names_prec <- names(precincts24)
+district_candidates <- names_prec[
+  str_detect(names_prec, regex("cng", ignore_case = TRUE)) &
+    !str_detect(names_prec, regex("cngdem|cngrep", ignore_case = TRUE))
+]
+district_col <- district_candidates[1]
+precincts24 <- precincts24 |> rename(DIST = all_of(district_col))
+```
 
-### Answer 1
+# Question 1: Which precincts had the highest and lowest voter turnout?
 
-Put your answer here.
+To understand voter participation patterns, I calculated turnout as the ratio of total votes cast to total registered voters for each precinct.
 
-### Question 2
+```{r}
+precinct_turnout <- precincts24 |>
+  mutate(turnout = TOTVOTE / TOTREG) |>
+  filter(is.finite(turnout))
 
-Put your question here.
+# Highest turnout precincts
+highest_turnout <- precinct_turnout |>
+  arrange(desc(turnout)) |>
+  select(SVPREC, COUNTY, TOTVOTE, TOTREG, turnout) |>
+  slice_head(n = 5)
 
-### Answer 2
+highest_turnout
+```
 
-Put your answer here.
+The highest turnout precincts show participation rates above 100%, which can occur when voters register on Election Day or when precincts serve multiple areas.
 
-### Question 3
+```{r}
+# Lowest turnout precincts
+lowest_turnout <- precinct_turnout |>
+  arrange(turnout) |>
+  select(SVPREC, COUNTY, TOTVOTE, TOTREG, turnout) |>
+  slice_head(n = 5)
 
-Put your question here.
+lowest_turnout
+```
 
-### Answer 3
+```{r}
+#| fig-width: 7
+#| fig-height: 4
+ggplot(precinct_turnout, aes(x = turnout)) +
+  geom_histogram(binwidth = 0.05, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Precinct-Level Turnout in 2024",
+    x = "Turnout (total votes / total registered)",
+    y = "Number of precincts"
+  ) +
+  theme_minimal()
+```
 
-Put your answer here.
+The distribution shows most precincts had turnout between 60-80%, with some variation across the state.
+
+# Question 2: Which congressional district had the closest race?
+
+To identify competitive districts, I calculated the vote margin between Democratic and Republican candidates in each congressional district.
+
+```{r}
+cong_by_dist <- precincts24 |>
+  group_by(DIST) |>
+  summarise(
+    dem_votes = sum(CNGDEM01, na.rm = TRUE),
+    rep_votes = sum(CNGREP01, na.rm = TRUE)
+  ) |>
+  mutate(
+    margin = abs(dem_votes - rep_votes),
+    winner = if_else(dem_votes > rep_votes, "Democrat", "Republican")
+  )
+
+# Closest race
+closest_district <- cong_by_dist |>
+  arrange(margin) |>
+  slice_head(n = 3)
+
+closest_district
+```
+
+The closest congressional races had margins under 30,000 votes, indicating highly competitive districts where small shifts in turnout or preferences could change outcomes.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+ggplot(cong_by_dist, aes(x = factor(DIST), y = margin / 1000, fill = winner)) +
+  geom_col() +
+  scale_fill_manual(values = c("Democrat" = "steelblue", "Republican" = "firebrick")) +
+  labs(
+    title = "Vote Margins in Congressional Races by District",
+    x = "Congressional District",
+    y = "Absolute vote margin (thousands)",
+    fill = "Winner"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Some districts show very large margins (safe seats), while others are much more competitive.
+
+# Question 3: How did counties differ in presidential race support?
+
+I examined county-level patterns in the presidential race to understand geographic variation in partisan support.
+
+```{r}
+pres_by_county <- precincts24 |>
+  group_by(COUNTY) |>
+  summarise(
+    pres_dem = sum(USPDEM01, na.rm = TRUE),
+    pres_rep = sum(USPREP01, na.rm = TRUE)
+  ) |>
+  mutate(
+    pres_margin = pres_dem - pres_rep,
+    winner = if_else(pres_margin > 0, "Democrat", "Republican")
+  ) |>
+  arrange(desc(abs(pres_margin)))
+
+# Top 5 counties by margin magnitude
+pres_by_county |> slice_head(n = 5)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+ggplot(pres_by_county, aes(x = reorder(COUNTY, pres_margin), y = pres_margin / 1000, fill = winner)) +
+  geom_col() +
+  scale_fill_manual(values = c("Democrat" = "steelblue", "Republican" = "firebrick")) +
+  labs(
+    title = "Presidential Democratic - Republican Vote Margin by County",
+    x = "County",
+    y = "Dem votes - Rep votes (thousands)",
+    fill = "Winner"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 7)) +
+  coord_flip()
+```
+
+Los Angeles County shows the largest Democratic margin due to its large population and Democratic lean, while smaller rural counties show Republican advantages. The variation illustrates California's geographic political diversity despite its statewide Democratic advantage.

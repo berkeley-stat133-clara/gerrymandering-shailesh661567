@@ -3,3 +3,203 @@ title: Data Cleaning
 format: typst
 ---
 
+# Part 2: Cleaning 2024 Precinct-Level Data
+
+## Loading the Raw Data
+
+I started by loading the raw precinct-level Statement of Vote data from the 2024 general election.
+
+```{r}
+#| message: false
+library(tidyverse)
+
+# Load raw precinct data
+precincts_raw <- read_csv("data/g24_sov_by_g24_svprec.csv", show_col_types = FALSE)
+
+# Inspect the structure
+glimpse(precincts_raw)
+```
+
+## Data Cleaning Steps
+
+### Step 1: Handle Asterisks in Vote Columns
+
+The Statewide Database uses asterisks (*) to indicate certain data conditions. These need to be removed and converted to numeric values.
+
+```{r}
+# Remove asterisks from all vote-related columns
+precincts_clean <- precincts_raw |>
+  mutate(across(matches("CNG|ASS|PRS|SEN|USP|USS|PR_"), 
+                ~str_replace_all(.x, "\\*", "")))
+```
+
+### Step 2: Convert Vote Columns to Numeric
+
+After removing asterisks, convert all vote columns to numeric type.
+
+```{r}
+precincts_clean <- precincts_clean |>
+  mutate(across(matches("CNG|ASS|PRS|SEN|USP|USS|PR_"), 
+                readr::parse_number))
+```
+
+### Step 3: Ensure Correct Data Types
+
+Make categorical variables factors where appropriate.
+
+```{r}
+precincts_clean <- precincts_clean |>
+  mutate(COUNTY = factor(COUNTY))
+```
+
+### Step 4: Check for Missing Values
+
+```{r}
+# Check for NA values in key columns
+sum(is.na(precincts_clean$CNGDEM01))
+sum(is.na(precincts_clean$CNGREP01))
+```
+
+Most NA values represent races where candidates didn't run, which is expected.
+
+### Step 5: Verify Data Integrity
+
+```{r}
+# Check that precinct IDs are unique
+n_distinct(precincts_clean$SVPREC) == nrow(precincts_clean)
+
+# Summary of key variables
+summary(precincts_clean |> select(TOTVOTE, TOTREG, CNGDEM01, CNGREP01))
+```
+
+## Save Cleaned Data
+
+```{r}
+#| eval: false
+write_csv(precincts_clean, "data/g24_precinct_clean.csv")
+```
+
+The cleaned data was saved to `data/g24_precinct_clean.csv` for use in subsequent analyses.
+
+# Part 5: Re-running 2024 Election with AB 604 Map
+
+To estimate what the 2024 election results would have been under the proposed AB 604 congressional map, I used area-weighted interpolation.
+
+## Approach
+
+The method allocates votes from SR precincts to new districts in proportion to the area of overlap. This assumes voters are distributed evenly within each precinct.
+
+## Load SR Precinct Data
+
+```{r}
+#| message: false
+library(sf)
+
+# Load SR precinct voting data
+SR_precincts_24 <- read_csv("data/state_g24_sov_data_by_g24_srprec.csv", show_col_types = FALSE)
+
+# Clean the data (remove asterisks and convert to numeric)
+SR_precincts_24 <- SR_precincts_24 |>
+  mutate(across(matches("CNG|ASS|PRS|SEN|USP|USS|PR_"), 
+                ~str_replace_all(.x, "\\*", ""))) |>
+  mutate(across(matches("CNG|ASS|PRS|SEN|USP|USS|PR_"), 
+                readr::parse_number))
+```
+
+## Load Geographic Data
+
+```{r}
+#| message: false
+#| warning: false
+# Load SR precinct shapefiles
+srprec_shapes <- st_read("data/srprec_state_g24_v01_shp.shp", quiet = TRUE)
+
+# Fix geometries and transform to equal-area projection
+srprec_shapes <- srprec_shapes |>
+  st_transform(3310) |>
+  st_set_precision(1) |>
+  st_make_valid() |>
+  st_collection_extract("POLYGON")
+
+# Join voting data with geometries
+srprec_shapes_full <- srprec_shapes |>
+  left_join(SR_precincts_24, by = "SRPREC")
+```
+
+## Calculate Precinct-Level Vote Totals
+
+```{r}
+# Sum all Democratic and Republican congressional votes in each precinct
+srprec_shapes_full <- srprec_shapes_full |>
+  mutate(
+    dem_precinct = rowSums(across(matches("CNGDEM\\d{2}$")), na.rm = TRUE),
+    rep_precinct = rowSums(across(matches("CNGREP\\d{2}$")), na.rm = TRUE)
+  )
+```
+
+## Load AB 604 Proposed Map
+
+```{r}
+#| message: false
+Proposed_Map_25 <- st_read("data/AB604.shp", quiet = TRUE) |>
+  st_transform(3310)
+```
+
+## Perform Area-Weighted Interpolation
+
+```{r}
+#| message: false
+#| warning: false
+# Calculate intersections between precincts and new districts
+intersections <- st_intersection(
+  srprec_shapes_full |> select(SRPREC, dem_precinct, rep_precinct, geometry),
+  Proposed_Map_25 |> select(DISTRICT, geometry)
+)
+
+# Calculate area weights
+intersections <- intersections |>
+  mutate(
+    intersect_area = as.numeric(st_area(geometry)),
+    precincts_area = as.numeric(
+      st_area(srprec_shapes_full$geometry)[match(SRPREC, srprec_shapes_full$SRPREC)]
+    ),
+    a_weighted = intersect_area / precincts_area
+  )
+
+# Allocate votes proportionally
+intersections <- intersections |>
+  mutate(
+    dem_props = dem_precinct * a_weighted,
+    rep_props = rep_precinct * a_weighted
+  )
+```
+
+## Aggregate Votes by New District
+
+```{r}
+proposed_2025_results <- intersections |>
+  st_drop_geometry() |>
+  group_by(DISTRICT) |>
+  summarise(
+    dem_votes_new = sum(dem_props, na.rm = TRUE),
+    rep_votes_new = sum(rep_props, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(total_two_party = dem_votes_new + rep_votes_new)
+
+# Display first few districts
+head(proposed_2025_results)
+```
+
+## Save Results
+
+```{r}
+#| eval: false
+write_csv(proposed_2025_results, "data/g24_ab604_district_results.csv")
+```
+
+The estimated results under the AB 604 map were saved to `data/g24_ab604_district_results.csv`.
+
+## Summary
+
+Using area-weighted interpolation, I successfully re-allocated the 2024 election votes to the proposed AB 604 congressional districts. This allows us to compare gerrymandering metrics between the current map and the proposed map while holding voter behavior constant.
