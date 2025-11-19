@@ -1,5 +1,415 @@
 ---
-title: Dashboard
-format: dashboard
+title: "California Congressional Districts: 2024 vs AB 604"
+format: 
+  dashboard:
+    orientation: columns
 ---
 
+```{r}
+#| include: false
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(htmltools)
+library(scales)
+
+# Helper function for wasted votes
+n_wasted <- function(votes_a, votes_b) {
+  ifelse(votes_a > votes_b, 
+         votes_a - (votes_a + votes_b) / 2, 
+         votes_a)
+}
+```
+
+```{r}
+#| include: false
+#| label: load-and-process-data
+
+# Load SR precinct data
+SR_precincts_24 <- read_csv("data/state_g24_sov_data_by_g24_srprec.csv", show_col_types = FALSE)
+
+SR_precincts_24 <- SR_precincts_24 |>
+  mutate(across(matches("CNG|ASS|PRS|SEN|USP|USS|PR_"), ~str_replace_all(.x, "\\*", "")))
+
+SR_precincts_24 <- SR_precincts_24 |>
+  mutate(across(matches("CNG|ASS|PRS|SEN|USP|USS|PR_"), readr::parse_number))
+
+# Load SR precinct shapes
+srprec_shapes <- st_read("data/srprec_state_g24_v01_shp.shp", quiet = TRUE)
+
+srprec_shapes <- srprec_shapes |>
+  st_transform(3310) |>
+  st_set_precision(1) |>
+  st_make_valid() |>
+  st_collection_extract("POLYGON")
+
+srprec_shapes_full <- srprec_shapes |>
+  left_join(SR_precincts_24, by = "SRPREC")
+
+# Calculate precinct-level totals
+srprec_shapes_full <- srprec_shapes_full |>
+  mutate(
+    dem_precinct = rowSums(across(matches("CNGDEM\\d{2}$")), na.rm = TRUE),
+    rep_precinct = rowSums(across(matches("CNGREP\\d{2}$")), na.rm = TRUE)
+  )
+
+# Load proposed AB604 map
+Proposed_Map_25 <- st_read("data/AB604.shp", quiet = TRUE) |>
+  st_transform(3310)
+
+# Calculate AB604 results using area-weighted interpolation
+intersections <- st_intersection(
+  srprec_shapes_full |> select(SRPREC, dem_precinct, rep_precinct, geometry),
+  Proposed_Map_25 |> select(DISTRICT, geometry)
+)
+
+intersections <- intersections |>
+  mutate(
+    intersect_area = as.numeric(st_area(geometry)),
+    precincts_area = as.numeric(st_area(srprec_shapes_full$geometry)[match(SRPREC, srprec_shapes_full$SRPREC)]),
+    a_weighted = intersect_area / precincts_area
+  )
+
+intersections <- intersections |>
+  mutate(
+    dem_props = dem_precinct * a_weighted,
+    rep_props = rep_precinct * a_weighted
+  )
+
+proposed_2025_map_dataframe <- intersections |>
+  st_drop_geometry() |>
+  group_by(DISTRICT) |>
+  summarise(
+    dem_votes = sum(dem_props, na.rm = TRUE),
+    rep_votes = sum(rep_props, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Calculate AB604 metrics
+new_map_gerrymandering <- proposed_2025_map_dataframe |>
+  mutate(dem_prop = dem_votes / (dem_votes + rep_votes))
+
+mean_median_2025_map <- mean(new_map_gerrymandering$dem_prop, na.rm = TRUE) - 
+                        median(new_map_gerrymandering$dem_prop, na.rm = TRUE)
+
+new_map_gerrymandering <- new_map_gerrymandering |>
+  mutate(
+    d_wasted = n_wasted(dem_votes, rep_votes),
+    r_wasted = n_wasted(rep_votes, dem_votes)
+  )
+
+efficiency_gap_new_map <- new_map_gerrymandering |>
+  ungroup() |>
+  summarise(
+    total_d_wasted = sum(d_wasted, na.rm = TRUE),
+    total_r_wasted = sum(r_wasted, na.rm = TRUE),
+    total_votes = sum(dem_votes + rep_votes, na.rm = TRUE)
+  ) |>
+  mutate(EG = (total_d_wasted - total_r_wasted) / total_votes)
+
+# Count seats for AB604
+dem_seats_ab604 <- sum(new_map_gerrymandering$dem_votes > new_map_gerrymandering$rep_votes)
+rep_seats_ab604 <- sum(new_map_gerrymandering$rep_votes > new_map_gerrymandering$dem_votes)
+```
+
+```{r}
+#| include: false
+#| label: process-2024-official
+
+# Check if 2024 official map exists
+official_2024_exists <- file.exists("data/tl_2024_06_cd119/tl_2024_06_cd119.shp")
+
+if (official_2024_exists) {
+  official_2024_map <- st_read("data/tl_2024_06_cd119/tl_2024_06_cd119.shp", quiet = TRUE) |>
+    st_transform(3310)
+  
+  intersections_2024 <- st_intersection(
+    srprec_shapes_full |> select(SRPREC, dem_precinct, rep_precinct, geometry),
+    official_2024_map |> select(CD119FP, geometry)
+  )
+  
+  intersections_2024 <- intersections_2024 |>
+    mutate(
+      intersect_area = as.numeric(st_area(geometry)),
+      precinct_area = as.numeric(st_area(srprec_shapes_full$geometry)[match(SRPREC, srprec_shapes_full$SRPREC)]),
+      area_weight = intersect_area / precinct_area,
+      dem_weighted = dem_precinct * area_weight,
+      rep_weighted = rep_precinct * area_weight
+    )
+  
+  official_2024_votes <- intersections_2024 |>
+    st_drop_geometry() |>
+    group_by(CD119FP) |>
+    summarise(
+      dem_votes = sum(dem_weighted, na.rm = TRUE),
+      rep_votes = sum(rep_weighted, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(
+      total_votes = dem_votes + rep_votes,
+      dem_prop = dem_votes / total_votes
+    )
+  
+  # Calculate 2024 metrics
+  mean_median_2024 <- mean(official_2024_votes$dem_prop, na.rm = TRUE) - 
+                      median(official_2024_votes$dem_prop, na.rm = TRUE)
+  
+  official_2024_metrics <- official_2024_votes |>
+    mutate(
+      d_wasted = n_wasted(dem_votes, rep_votes),
+      r_wasted = n_wasted(rep_votes, dem_votes)
+    ) |>
+    summarise(
+      total_d_wasted = sum(d_wasted, na.rm = TRUE),
+      total_r_wasted = sum(r_wasted, na.rm = TRUE),
+      total_votes = sum(dem_votes + rep_votes, na.rm = TRUE)
+    ) |>
+    mutate(EG = (total_d_wasted - total_r_wasted) / total_votes)
+  
+  efficiency_gap_2024 <- official_2024_metrics$EG
+  dem_seats_2024 <- sum(official_2024_votes$dem_votes > official_2024_votes$rep_votes)
+  rep_seats_2024 <- sum(official_2024_votes$rep_votes > official_2024_votes$dem_votes)
+  
+} else {
+  # Use precinct data as fallback
+  precincts24 <- read_csv("data/g24_precinct_clean.csv", show_col_types = FALSE)
+  district_col <- names(precincts24)[str_detect(names(precincts24), regex("cng", ignore_case = TRUE)) &
+      !str_detect(names(precincts24), regex("cngdem|cngrep", ignore_case = TRUE))][1]
+  
+  precincts24 <- precincts24 |> rename(DIST = all_of(district_col))
+  
+  results_2024 <- precincts24 |>
+    group_by(DIST) |>
+    summarise(
+      dem_votes = sum(CNGDEM01, na.rm = TRUE),
+      rep_votes = sum(CNGREP01, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    filter((dem_votes + rep_votes) > 0) |>
+    mutate(dem_prop = dem_votes / (dem_votes + rep_votes))
+  
+  mean_median_2024 <- mean(results_2024$dem_prop) - median(results_2024$dem_prop)
+  
+  results_2024_metrics <- results_2024 |>
+    mutate(
+      d_wasted = n_wasted(dem_votes, rep_votes),
+      r_wasted = n_wasted(rep_votes, dem_votes)
+    ) |>
+    summarise(
+      total_d_wasted = sum(d_wasted, na.rm = TRUE),
+      total_r_wasted = sum(r_wasted, na.rm = TRUE),
+      total_votes = sum(dem_votes + rep_votes, na.rm = TRUE)
+    ) |>
+    mutate(EG = (total_d_wasted - total_r_wasted) / total_votes)
+  
+  efficiency_gap_2024 <- results_2024_metrics$EG
+  dem_seats_2024 <- sum(results_2024$dem_votes > results_2024$rep_votes)
+  rep_seats_2024 <- sum(results_2024$rep_votes > results_2024$dem_votes)
+}
+```
+
+# Overview
+
+## Column {width=50%}
+
+### 2024 Election Results
+
+**Seats Won:**
+
+- Democrats: **`{r} dem_seats_2024`** seats
+- Republicans: **`{r} rep_seats_2024`** seats
+
+**Gerrymandering Metrics:**
+
+- Mean-Median Score: **`{r} round(mean_median_2024, 4)`**
+- Efficiency Gap: **`{r} round(efficiency_gap_2024, 4)`**
+
+### What do these metrics mean?
+
+**Mean-Median Score** measures whether Democratic vote shares are distributed symmetrically across districts. A value close to 0 suggests balance.
+
+**Efficiency Gap** measures "wasted votes" - votes for losing candidates plus votes beyond what's needed to win. Positive values indicate more wasted Democratic votes (Republican advantage).
+
+## Column {width=50%}
+
+### AB 604 Proposed Map (Hypothetical)
+
+**Seats Won:**
+
+- Democrats: **`{r} dem_seats_ab604`** seats  
+- Republicans: **`{r} rep_seats_ab604`** seats
+
+**Gerrymandering Metrics:**
+
+- Mean-Median Score: **`{r} round(mean_median_2025_map, 4)`**
+- Efficiency Gap: **`{r} round(efficiency_gap_new_map$EG, 4)`**
+
+### Changes from 2024 to AB 604
+
+```{r}
+tibble(
+  Metric = c("Democratic Seats", "Republican Seats", "Mean-Median Score", "Efficiency Gap"),
+  `2024` = c(dem_seats_2024, rep_seats_2024, round(mean_median_2024, 4), round(efficiency_gap_2024, 4)),
+  `AB 604` = c(dem_seats_ab604, rep_seats_ab604, round(mean_median_2025_map, 4), round(efficiency_gap_new_map$EG, 4)),
+  Change = c(
+    dem_seats_ab604 - dem_seats_2024,
+    rep_seats_ab604 - rep_seats_2024,
+    round(mean_median_2025_map - mean_median_2024, 4),
+    round(efficiency_gap_new_map$EG - efficiency_gap_2024, 4)
+  )
+) |> knitr::kable()
+```
+
+# Maps
+
+## Column {width=50%}
+
+### 2024 Congressional Districts
+
+```{r}
+if (official_2024_exists) {
+  official_district_2024 <- official_2024_map |>
+    left_join(official_2024_votes, by = "CD119FP") |>
+    mutate(CDDIST = CD119FP)
+  
+  official_dist_4326 <- st_transform(official_district_2024, 4326)
+  
+  color_palette_2024 <- colorNumeric(palette = "RdBu", domain = official_dist_4326$dem_prop)
+  
+  labels_official_2024 <- paste0(
+    "<strong>2024 District: ", official_dist_4326$CDDIST, "</strong><br/>",
+    "Democratic Share: ", percent(official_dist_4326$dem_prop, accuracy = 0.1), "<br/>",
+    "Democrat Votes: ", format(official_dist_4326$dem_votes, big.mark = ",")
+  ) |> lapply(HTML)
+  
+  leaflet(data = official_dist_4326) |>
+    addProviderTiles(providers$CartoDB.Positron) |>
+    addPolygons(
+      fillColor = ~color_palette_2024(dem_prop),
+      weight = 1.5,
+      opacity = 1,
+      color = "white",
+      fillOpacity = 0.7,
+      highlightOptions = highlightOptions(weight = 3, color = "#666", fillOpacity = 0.9),
+      label = labels_official_2024
+    )
+} else {
+  htmltools::div(
+    style = "padding: 40px; text-align: center;",
+    htmltools::h4("2024 District Map Not Available"),
+    htmltools::p("Download the 2024 congressional district shapefile and place in data/tl_2024_06_cd119/")
+  )
+}
+```
+
+## Column {width=50%}
+
+### AB 604 Proposed Districts
+
+```{r}
+proposed_district_map <- Proposed_Map_25 |>
+  left_join(
+    new_map_gerrymandering |> select(DISTRICT, dem_votes, rep_votes, dem_prop),
+    by = "DISTRICT"
+  ) |>
+  mutate(total_votes = dem_votes + rep_votes)
+
+proposed_district_map_4326 <- st_transform(proposed_district_map, 4326)
+
+color_palette_2025 <- colorNumeric(palette = "RdBu", domain = proposed_district_map_4326$dem_prop)
+
+labels_proposed_2025 <- paste0(
+  "<strong>Proposed District: ", proposed_district_map_4326$DISTRICT, "</strong><br/>",
+  "Democratic Share: ", percent(proposed_district_map_4326$dem_prop, accuracy = 0.1), "<br/>",
+  "Democrat Votes: ", format(proposed_district_map_4326$dem_votes, big.mark = ",")
+) |> lapply(HTML)
+
+leaflet(data = proposed_district_map_4326) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    fillColor = ~color_palette_2025(dem_prop),
+    weight = 1.5,
+    opacity = 1,
+    color = "white",
+    fillOpacity = 0.7,
+    highlightOptions = highlightOptions(weight = 3, color = "#666", fillOpacity = 0.9),
+    label = labels_proposed_2025
+  )
+```
+
+# District Details
+
+## Column
+
+### 2024 District Results
+
+```{r}
+if (official_2024_exists) {
+  official_2024_votes |>
+    mutate(
+      District = CD119FP,
+      `Dem Votes` = comma(round(dem_votes)),
+      `Rep Votes` = comma(round(rep_votes)),
+      `Dem %` = percent(dem_prop, accuracy = 0.1),
+      Winner = ifelse(dem_votes > rep_votes, "Democrat", "Republican")
+    ) |>
+    select(District, `Dem Votes`, `Rep Votes`, `Dem %`, Winner) |>
+    knitr::kable()
+} else {
+  results_2024 |>
+    mutate(
+      District = sprintf("%02d", DIST),
+      `Dem Votes` = comma(dem_votes),
+      `Rep Votes` = comma(rep_votes),
+      `Dem %` = percent(dem_prop, accuracy = 0.1),
+      Winner = ifelse(dem_votes > rep_votes, "Democrat", "Republican")
+    ) |>
+    select(District, `Dem Votes`, `Rep Votes`, `Dem %`, Winner) |>
+    knitr::kable()
+}
+```
+
+### AB 604 District Results
+
+```{r}
+new_map_gerrymandering |>
+  mutate(
+    District = sprintf("%02d", as.numeric(DISTRICT)),
+    `Dem Votes` = comma(round(dem_votes)),
+    `Rep Votes` = comma(round(rep_votes)),
+    `Dem %` = percent(dem_prop, accuracy = 0.1),
+    Winner = ifelse(dem_votes > rep_votes, "Democrat", "Republican")
+  ) |>
+  select(District, `Dem Votes`, `Rep Votes`, `Dem %`, Winner) |>
+  knitr::kable()
+```
+
+# Methodology
+
+## Column
+
+### Data Sources
+
+- **2024 Election Data**: California Statewide Database - SR precinct-level Statement of Vote data
+- **AB 604 Map**: California Assembly Elections Committee proposed congressional district boundaries
+- **Geographic Data**: SR precinct shapefiles and congressional district shapefiles
+
+### Estimation Approach
+
+I used **area-weighted interpolation** to estimate what the 2024 election results would have been under the AB 604 district map:
+
+1. Loaded SR precinct voting data and geographic boundaries
+2. Calculated the intersection between SR precincts and new AB 604 districts
+3. For each precinct-district intersection, calculated the proportion of the precinct's area within that district
+4. Allocated votes proportionally based on area overlap
+5. Summed allocated votes to get new district totals
+
+This assumes voters are distributed evenly across their precincts.
+
+### Limitations
+
+- Based on single election (2024 general election)
+- Area-weighted interpolation assumes uniform voter distribution
+- Natural geographic clustering can mimic gerrymandering patterns
+- Third-party votes excluded from calculations
+- Metrics cannot definitively prove intentional gerrymandering

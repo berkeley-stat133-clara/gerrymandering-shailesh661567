@@ -1,0 +1,13 @@
+# Large shapefiles (too big for GitHub)
+data/srprec_state_g24_v01_shp.shp
+data/srprec_state_g24_v01_shp.dbf
+data/srprec_state_g24_v01_shp.shx
+data/srprec_state_g24_v01_shp.prj
+data/srprec_state_g24_v01_shp.cpg
+
+# Dashboard generated files
+dashboard_files/
+
+# Other large files
+data/state_g24_sov_data_by_g24_srprec.numbers
+
